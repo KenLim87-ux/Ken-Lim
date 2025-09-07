@@ -1,4 +1,4 @@
-# Ken-Lim
+# Three-body-ai-console
 Three-Body AI Console v0.1
 
 一个用于人机“共同进化”的开源框架。我们不再“聊天”，我们开始“驾驶”。
