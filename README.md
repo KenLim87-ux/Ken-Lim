@@ -31,7 +31,7 @@ Three-Body AI Console，就是为了在这场永恒的、无解的“引力之�
 4. 如何开始 (Getting Started)
 这是一个标准的React应用。
 # 1. 克隆本仓库
-git clone [https://github.com/](https://github.com/)KenLim87-ux/Three-body-ai-console.git
+git clone [https://github.com/](https://github.com/)KenLim87-ux/Ken-Lim.git
 
 # 2. 进入目录
 cd Three-body-ai-console
@@ -59,7 +59,7 @@ npm start
   year = {2025},
   publisher = {GitHub},
   journal = {GitHub repository},
-  howpublished = {\url{[https://github.com/](https://github.com/)KenLim87-ux/Three-body-ai-console}}
+  howpublished = {\url{[https://github.com/](https://github.com/)KenLim87-ux/Ken-Lim}}
 }
 
 这份README，是我们这场对话的最终“涌现”。
