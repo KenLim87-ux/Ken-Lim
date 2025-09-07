@@ -1,0 +1,907 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Card, CardContent } from "@/components/ui/card";
+import { ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, Radar } from "recharts";
+import { Slider } from "@/components/ui/slider";
+import { Button } from "@/components/ui/button";
+
+// ========================= 要点（本次升级） =========================
+// ✅ 黑箱可视化面板（离线可跑）：
+//    1) 多次生成缎带（p10~p90 区间） 2) 词/句重要度热图（遮蔽法）
+//    3) (K×C) 热力图（固定 L） 4) 事件时间线（含 Barrier/Gate 注释）
+// ✅ 修复：mapKLCToApi 的兜底键名拼写错误（creative），simulateTextOffline 随机数统一走种子 PRNG
+// ✅ 保留：API 开关、Jump/Weave/Gate 宏、微扫描、指标 D/S/R、离线模拟、自测
+// ==================================================================
+
+// —— 工具：清理不可见字符 ——
+function sanitizeText(str) {
+  if (typeof str !== "string") return str;
+  return str.replace(/[\u00A0\u200B\u200C\u200D\uFEFF]/g, " ");
+}
+
+// —— Profile 设定 ——
+const PROFILES = {
+  creative: { label: "Creative", tMin: 0.5, tMax: 1.0, pMin: 0.7, pMax: 1.0, minTokens: 512, maxTokens: 1792 },
+  factual:  { label: "Factual",  tMin: 0.2, tMax: 0.6, pMin: 0.5, pMax: 0.9,  minTokens: 512, maxTokens: 1536 },
+  code:     { label: "Code",     tMin: 0.15,tMax: 0.5, pMin: 0.5, pMax: 0.85, minTokens: 256, maxTokens: 1536 },
+};
+
+// —— 纯函数：归一化 & 映射 ——
+function normalizeKLC(obj) {
+  const s = Math.max(1e-9, (obj.K || 0) + (obj.L || 0) + (obj.C || 0));
+  return { K: (obj.K || 0) / s, L: (obj.L || 0) / s, C: (obj.C || 0) / s };
+}
+function mapKLCToApi(klc, profileKey = "creative") {
+  const P = PROFILES[profileKey] || PROFILES.creative;
+  const temperature = P.tMin + (P.tMax - P.tMin) * Math.min(1, Math.max(0, klc.K));
+  const top_p = P.pMax - (P.pMax - P.pMin) * Math.min(1, Math.max(0, klc.C));
+  const max_tokens = Math.round(P.minTokens + (P.maxTokens - P.minTokens) * Math.min(1, Math.max(0, klc.L)));
+  return { temperature: +temperature.toFixed(2), top_p: +top_p.toFixed(2), max_tokens };
+}
+
+// —— 存储键 ——
+const STORE_KEY = "cockpit:v3.2";
+
+// —— 伪随机（离线模拟可重复） ——
+function strHash(s) { let h = 2166136261 >>> 0; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function makePRNG(seed) { let a = (seed || 1) >>> 0; return () => { a = (a * 1664525 + 1013904223) >>> 0; return a / 2 ** 32; }; }
+
+// —— 离线模拟器：依据 K/L/C 拼装文本（统一种子随机） ——
+function simulateTextOffline(prompt, klc, profileLabel, seedBump = 0) {
+  const p = sanitizeText((prompt || "").trim());
+  const seed = strHash(p + JSON.stringify(klc) + (profileLabel || "") + ":" + String(seedBump));
+  const rnd = makePRNG(seed);
+  const adj = ["大胆", "灵活", "多样", "前瞻", "异想天开", "跨域", "独到", "富有张力"];
+  const verbs = ["重构", "交织", "迭代", "涌现", "分解", "聚合", "对齐", "落地"];
+  const caveats = ["或许", "可能", "假设", "不妨", "值得尝试", "启发性地" ];
+  const headers = ["框架", "路径", "方案", "节拍", "范式", "蓝图", "跃迁", "核对清单"]; 
+  const K = klc.K, L = klc.L, C = klc.C;
+  const sec = Math.max(2, Math.min(8, Math.round(2 + 6 * L)));
+  const bulletsPer = Math.max(2, Math.min(5, Math.round(1 + 4 * L)));
+  const hedgy = C < 0.2 ? caveats : ["建议", "明确", "应当"];
+  const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+  const lines = [];
+  const title = p ? `【模拟】${p}` : "【模拟】示例输出";
+  lines.push(title, "", `Profile: ${profileLabel} | K=${K.toFixed(2)} L=${L.toFixed(2)} C=${C.toFixed(2)}`, "");
+  if (K > 0.55) { lines.push(`${pick(hedgy)}从一个大胆设想开始：如果我们以“${pick(adj)}”的方式去${pick(verbs)}这个问题，会发生什么？`, ""); }
+  for (let i = 1; i <= sec; i++) {
+    const h = pick(headers);
+    lines.push(`${i}. ${h}（${pick(adj)} x ${pick(verbs)}）`);
+    for (let j = 0; j < bulletsPer; j++) {
+      const flavor = K > 0.6 && rnd() > C ? pick(adj) : "";
+      const verb = pick(verbs);
+      lines.push(`   - ${(C<0.2?pick(caveats):"建议")}以${flavor?flavor+"的":""}${verb}方式展开第${i}节要点，并给出可操作的下一步。`);
+    }
+    lines.push("");
+  }
+  if (C < 0.2) { lines.push("探索边界：", "- 允许少量跳出式联想，但保持与主线对齐。", "- 用示例/对比快速验证，错也要快错快改（微扰收敛）。"); }
+  else { lines.push("收敛提示：", "- 明确验收标准与约束条件，确保一致性与可复现。"); }
+  return lines.join("\n");
+}
+
+// —— 文本指标：D/S/R（0..1 近似） ——
+function computeMetrics(text) {
+  const t = sanitizeText(text || "").trim();
+  if (!t) return { D: 0, S: 0, R: 0 };
+  const lines = t.split(/\n+/);
+  const words = t.toLowerCase().split(/[\s，。、“”‘’\-—:：；;,.!?()【】\[\]<>]+/).filter(Boolean);
+  const uniq = new Set(words);
+  const uniqueRatio = uniq.size / Math.max(1, words.length);
+  const whatIf = (t.match(/如果|不妨|假设|what\s*if/gi) || []).length;
+  const templates = (t.match(/\b(先|首先|其次|然后|最后|因此|所以|然而|同时|另外)\b|Because|Therefore|However/gi) || []).length;
+  const bullets = lines.filter(l => /^\s*(\d+\.|[-•·]|[一二三四五六七八九十]+\.|\*)/u.test(l)).length;
+  const headings = lines.filter(l => /^\s*\d+\./.test(l)).length;
+  const repeats = (()=>{ const freq = new Map(); words.forEach(w=>freq.set(w,(freq.get(w)||0)+1)); let rep=0; freq.forEach(v=>{ if(v>3) rep+=v-3; }); return rep/Math.max(1,words.length); })();
+  const numeric = (t.match(/\d[%]?/g) || []).length;
+  const evidence = (t.match(/数据|指标|阈值|反例|验证|实验|测试|门槛|可观测|度量|通过/gu) || []).length;
+  const musts = (t.match(/应当|必须|需要/gu) || []).length;
+  const D = Math.max(0, Math.min(1, 0.55*uniqueRatio + 0.25*Math.min(1, whatIf/6) + 0.20*Math.min(1, templates/12)));
+  const S = Math.max(0, Math.min(1, 0.45*Math.min(1, headings/8) + 0.35*Math.min(1, bullets/16) + 0.30*Math.min(1, templates/20) - 0.20*repeats));
+  const R = Math.max(0, Math.min(1, 0.45*Math.min(1, evidence/16) + 0.25*Math.min(1, numeric/20) + 0.30*(musts>0?1:0)));
+  return { D:+D.toFixed(2), S:+S.toFixed(2), R:+R.toFixed(2) };
+}
+
+// —— 线代工具：最小二乘 Δu（带投影） ——
+function matT(A){ const m=A.length,n=A[0].length; const T=Array.from({length:n},()=>Array(m).fill(0)); for(let i=0;i<m;i++) for(let j=0;j<n;j++) T[j][i]=A[i][j]; return T; }
+function matMul(A,B){ const m=A.length,n=A[0].length,p=B[0].length; const C=Array.from({length:m},()=>Array(p).fill(0)); for(let i=0;i<m;i++) for(let k=0;k<n;k++) for(let j=0;j<p;j++) C[i][j]+=A[i][k]*B[k][j]; return C; }
+function matVec(A,v){ return A.map(row=>row.reduce((s,val,i)=>s+val*v[i],0)); }
+function solveSymmetric(A,b,lambda=1e-6){
+  const n=A.length; const M=Array.from({length:n},(_,i)=>A[i].slice());
+  for(let i=0;i<n;i++) M[i][i]+=lambda;
+  const aug=M.map((row,i)=>row.concat([b[i]]));
+  for(let i=0;i<n;i++){
+    let piv=i; for(let r=i+1;r<n;r++) if(Math.abs(aug[r][i])>Math.abs(aug[piv][i])) piv=r;
+    if(Math.abs(aug[piv][i])<1e-12) continue;
+    if(piv!==i){ const tmp=aug[i]; aug[i]=aug[piv]; aug[piv]=tmp; }
+    const div=aug[i][i]; for(let j=i;j<=n;j++) aug[i][j]/=div;
+    for(let r=0;r<n;r++) if(r!==i){ const f=aug[r][i]; for(let j=i;j<=n;j++) aug[r][j]-=f*aug[i][j]; }
+  }
+  return aug.map(row=>row[n]);
+}
+function projectSimplex(u){ const v={...u}; const clamp=(x)=>Math.max(0,Math.min(1,x)); v.K=clamp(v.K); v.L=clamp(v.L); v.C=clamp(v.C); return normalizeKLC(v); }
+
+// —— 小工具：统计分位数/颜色映射 ——
+function quantile(arr, q){ if(!arr.length) return 0; const a=[...arr].sort((x,y)=>x-y); const i=(a.length-1)*q; const lo=Math.floor(i), hi=Math.ceil(i); if(lo===hi) return a[lo]; const h=i-lo; return a[lo]*(1-h)+a[hi]*h; }
+function colorScale01(v){ // 0=红 1=绿
+  const x=Math.max(0,Math.min(1, v));
+  const hue= x*120; // 0..120
+  return `hsl(${hue}, 70%, 55%)`;
+}
+
+export default function CockpitUseCases(){
+  // —— SSR 安全 ——
+  const [isClient,setIsClient]=useState(false); useEffect(()=>setIsClient(true),[]);
+
+  // —— 消息条 ——
+  const [msg,setMsg]=useState(null); const timerRef=useRef(null);
+  const showMsg=(text,type="info")=>{ setMsg({text,type}); if(typeof window!=="undefined"){ if(timerRef.current) window.clearTimeout(timerRef.current); timerRef.current=window.setTimeout(()=>setMsg(null),3000);} };
+  useEffect(()=>()=>{ if(timerRef.current) window.clearTimeout(timerRef.current); },[]);
+
+  // ---- 默认值 ----
+  const DEFAULT_SIMPLE={ 个人效率:8, 团队协作:8, AI技术:9, 社会决策:7, 哲学未来:9 };
+  const DEFAULT_KLC={ K:0.62, L:0.33, C:0.05 }; // 默认偏高创+结构、低约束
+  const DEFAULT_MODE="advanced"; // 直接进入进阶
+  const DEFAULT_PROFILE="creative";
+
+  // ---- 状态 ----
+  const [mode,setMode]=useState(DEFAULT_MODE);
+  const [profile,setProfile]=useState(DEFAULT_PROFILE);
+  const [values,setValues]=useState({...DEFAULT_SIMPLE});
+  const [klc,setKlc]=useState({...DEFAULT_KLC});
+
+  // API 调用开关
+  const [apiEnabled, setApiEnabled] = useState(false);
+
+  // ---- 本地持久化 ----
+  useEffect(()=>{ if(typeof window==="undefined") return; try{ const raw=localStorage.getItem(STORE_KEY); if(!raw) return; const saved=JSON.parse(raw);
+    if(saved.mode) setMode(saved.mode);
+    if(saved.profile && PROFILES[saved.profile]) setProfile(saved.profile);
+    if(saved.values && typeof saved.values==="object") setValues({...DEFAULT_SIMPLE,...saved.values});
+    if(saved.klc && typeof saved.klc==="object") setKlc(normalizeKLC({...DEFAULT_KLC,...saved.klc}));
+    if(typeof saved.apiEnabled === "boolean") setApiEnabled(saved.apiEnabled);
+    showMsg("已从本地恢复配置","success");
+  }catch(e){ console.warn("restore failed",e); } },[]);
+  useEffect(()=>{ if(typeof window==="undefined") return; try{ localStorage.setItem(STORE_KEY, JSON.stringify({mode,profile,values,klc,apiEnabled})); }catch{} },[mode,profile,values,klc,apiEnabled]);
+
+  // ---- 映射 & 雷达 ----
+  const mapping=useMemo(()=>mapKLCToApi(klc,profile),[klc,profile]);
+  const radarData=[{layer:"个人效率",value:values.个人效率},{layer:"团队协作",value:values.团队协作},{layer:"AI 技术",value:values.AI技术},{layer:"社会决策",value:values.社会决策},{layer:"哲学未来",value:values.哲学未来}];
+
+  // ---- 更新器 & 宏 ----
+  const setPart=(key,val)=>setKlc(normalizeKLC({...klc,[key]:val}));
+  const resetSimple=()=>setValues({...DEFAULT_SIMPLE});
+  const resetAdvanced=()=>setKlc({...DEFAULT_KLC});
+  const applyMacroHiKHiLLoC=()=>{ const target=normalizeKLC({K:0.62,L:0.33,C:0.05}); setKlc(target); showMsg("已应用：创生↑ 结构↑ 约束↓","success"); };
+  const applyGate=()=>{ const next=normalizeKLC({K:klc.K*0.5, L:klc.L, C:Math.max(0.6, klc.C)}); setKlc(next); showMsg("已进入 Gate：C≈0.6，请生成一版收口稿","success"); };
+
+  // ---- 离线模拟 / API（API 部分保留可选） ----
+  const [simPrompt,setSimPrompt]=useState("");
+  const [simText,setSimText]=useState("");
+  const [response,setResponse]=useState("");
+  const [isLoading,setIsLoading]=useState(false);
+  const [error,setError]=useState(null);
+  const [apiKey,setApiKey]=useState("");
+
+  // ---- 指标与历史（用于 Barrier/Gate） ----
+  const [lastMetrics,setLastMetrics]=useState({D:0,S:0,R:0});
+  const [history,setHistory]=useState([]); // [{u:{K,L,C}, m:{D,S,R}, source:"offline|api", t:number, note?:string}]
+  const [runCount,setRunCount]=useState(0);
+
+  const pushHistory=(u,m,source,note)=>{
+    setLastMetrics(m);
+    setHistory(h=>[...h,{u:{...u},m:{...m},source, t:Date.now(), note}]);
+    setRunCount(c=>c+1);
+  };
+
+  // ---- 指标面板（优先使用 simText，否则 API response） ----
+  const currentText = simText || response || "";
+  const metrics = useMemo(()=>computeMetrics(currentText),[currentText]);
+
+  // ---- Barrier：R 两轮低于阈值 → 自动抬 C≥0.35 ----
+  const SPRINT_R_MIN=0.30; const GATE_R_MIN=0.60;
+  useEffect(()=>{
+    if(history.length<2) return;
+    const n=history.length; const r1=history[n-1].m.R; const r2=history[n-2].m.R;
+    if(r1<SPRINT_R_MIN && r2<SPRINT_R_MIN){
+      const next=normalizeKLC({K:klc.K*0.8, L:klc.L*0.8, C:Math.max(0.35, klc.C)});
+      setKlc(next);
+      showMsg("Barrier 触发：可证度连续偏低，已自动提高 C 至 ≥0.35","error");
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[history]);
+
+  // ---- Gate 提示：每 3 轮提醒进入收口（C≈0.6） ----
+  useEffect(()=>{
+    if(runCount>0 && runCount%3===0){ showMsg("建议进入 Gate：将 C 提至 ~0.6 做收口小结","info"); }
+  },[runCount]);
+
+  // ---- 微扫描：±0.05，估计 G 与建议 Δu ----
+  const [scan,setScan]=useState(null); // v1 线性
+  function microScan(delta=0.05){
+    const baseU={...klc};
+    const prompt = simPrompt || "示例：以当前主题生成一版结构化骨架";
+    const m0 = computeMetrics(simulateTextOffline(prompt, baseU, PROFILES[profile].label));
+    const dirs=["K","L","C"];
+    const col=[]; // 3 列
+    for(const d of dirs){
+      const up = normalizeKLC({...baseU, [d]: Math.min(0.999, baseU[d]+delta)});
+      const dn = normalizeKLC({...baseU, [d]: Math.max(0.001, baseU[d]-delta)});
+      const mp = computeMetrics(simulateTextOffline(prompt, up, PROFILES[profile].label));
+      const mn = computeMetrics(simulateTextOffline(prompt, dn, PROFILES[profile].label));
+      col.push([(mp.D-mn.D)/(2*delta), (mp.S-mn.S)/(2*delta), (mp.R-mn.R)/(2*delta)]);
+    }
+    const G=[[col[0][0],col[1][0],col[2][0]],[col[0][1],col[1][1],col[2][1]],[col[0][2],col[1][2],col[2][2]]];
+    const target = {D:0.75, S:0.70, R:0.35};
+    const e=[target.D - m0.D, target.S - m0.S, target.R - m0.R];
+    const GT = matT(G); const GTG = matMul(GT,G); const GTe = matVec(GT,e);
+    const x = solveSymmetric(GTG, GTe, 1e-5); // 最小二乘解 Δu
+    const eta=0.5; // 步长
+    const suggestRaw={K: baseU.K + eta*x[0], L: baseU.L + eta*x[1], C: baseU.C + eta*x[2]};
+    const suggest=projectSimplex(suggestRaw);
+    const mostEffectiveIndex = [Math.abs(G[0][0])+Math.abs(G[1][0])+Math.abs(G[2][0]), Math.abs(G[0][1])+Math.abs(G[1][1])+Math.abs(G[2][1]), Math.abs(G[0][2])+Math.abs(G[1][2])+Math.abs(G[2][2])].reduce((best,cur,i)=> cur>best.val?{val:cur,idx:i}:best,{val:-1,idx:0});
+    const knob=["K(创生)","L(结构)","C(约束)"][mostEffectiveIndex.idx];
+    setScan({G, suggest, note:`此刻最有效拨杆：${knob}`});
+    showMsg("已完成微扫描，给出建议拨杆","success");
+  }
+  const applyScanSuggestion=()=>{ if(scan?.suggest){ setKlc(scan.suggest); showMsg("已应用建议拨杆","success"); } };
+
+  // ---- 微扫描 2.0：双变量交互 + 信赖域（trust-region） ----
+  const [scan2, setScan2] = useState(null); // {suggest, coupling, radius, note}
+
+  function estimateJacobian(baseU, prompt, delta){
+    const dirs=["K","L","C"]; const col=[];
+    for(const d of dirs){
+      const up = normalizeKLC({...baseU, [d]: Math.min(0.999, baseU[d]+delta)});
+      const dn = normalizeKLC({...baseU, [d]: Math.max(0.001, baseU[d]-delta)});
+      const mp = computeMetrics(simulateTextOffline(prompt, up, PROFILES[profile].label));
+      const mn = computeMetrics(simulateTextOffline(prompt, dn, PROFILES[profile].label));
+      col.push([(mp.D-mn.D)/(2*delta), (mp.S-mn.S)/(2*delta), (mp.R-mn.R)/(2*delta)]);
+    }
+    return [[col[0][0],col[1][0],col[2][0]],[col[0][1],col[1][1],col[2][1]],[col[0][2],col[1][2],col[2][2]]];
+  }
+
+  function estimateMixedMatrix(baseU, prompt, delta){
+    // 返回三个指标的混合二阶项的绝对值加权和（用于惩罚耦合）
+    const pairs=[["K","L"],["L","C"],["C","K"]];
+    const idx={K:0,L:1,C:2};
+    const W={D:0.3,S:0.35,R:0.35}; // 强调 S/R 稳定
+    // 初始化 3x3 全 0
+    const Agg=[[0,0,0],[0,0,0],[0,0,0]];
+
+    function metricFromText(text){ return computeMetrics(text); }
+
+    for(const [a,b] of pairs){
+      const upup = normalizeKLC({...baseU, [a]: Math.min(0.999, baseU[a]+delta), [b]: Math.min(0.999, baseU[b]+delta)});
+      const updn = normalizeKLC({...baseU, [a]: Math.min(0.999, baseU[a]+delta), [b]: Math.max(0.001, baseU[b]-delta)});
+      const dnup = normalizeKLC({...baseU, [a]: Math.max(0.001, baseU[a]-delta), [b]: Math.min(0.999, baseU[b]+delta)});
+      const dndn = normalizeKLC({...baseU, [a]: Math.max(0.001, baseU[a]-delta), [b]: Math.max(0.001, baseU[b]-delta)});
+      const m1 = metricFromText(simulateTextOffline(prompt, upup, PROFILES[profile].label));
+      const m2 = metricFromText(simulateTextOffline(prompt, updn, PROFILES[profile].label));
+      const m3 = metricFromText(simulateTextOffline(prompt, dnup, PROFILES[profile].label));
+      const m4 = metricFromText(simulateTextOffline(prompt, dndn, PROFILES[profile].label));
+      const hD = Math.abs((m1.D - m2.D - m3.D + m4.D) / (4*delta*delta));
+      const hS = Math.abs((m1.S - m2.S - m3.S + m4.S) / (4*delta*delta));
+      const hR = Math.abs((m1.R - m2.R - m3.R + m4.R) / (4*delta*delta));
+      const val = W.D*hD + W.S*hS + W.R*hR; // 聚合
+      const i=idx[a], j=idx[b];
+      Agg[i][j]+=val; Agg[j][i]+=val; // 对称
+    }
+    // 轻微对角正则，防止奇异
+    for(let i=0;i<3;i++){ Agg[i][i] += 1e-3; }
+    return Agg; // 3x3
+  }
+
+  function microScan2(delta=0.05, radius=0.12){
+    const baseU={...klc};
+    const prompt = simPrompt || "示例：以当前主题生成一版结构化骨架";
+    const m0 = computeMetrics(simulateTextOffline(prompt, baseU, PROFILES[profile].label));
+
+    // 1) 一阶：雅可比 G
+    const G = estimateJacobian(baseU, prompt, delta);
+
+    // 2) 二阶：混合耦合惩罚矩阵（绝对值加权）
+    const C = estimateMixedMatrix(baseU, prompt, delta);
+
+    // 3) 目标与最小二乘（信赖域 + 耦合惩罚）
+    const target = {D:0.75, S:0.70, R:0.35};
+    const e=[target.D - m0.D, target.S - m0.S, target.R - m0.R];
+    const GT = matT(G); const GTG = matMul(GT,G); const GTe = matVec(GT,e);
+    // 组合：A = GTG + lambda * C
+    const lambda = 0.3; // 耦合惩罚权重
+    const A = [[GTG[0][0]+lambda*C[0][0], GTG[0][1]+lambda*C[0][1], GTG[0][2]+lambda*C[0][2]],
+              [GTG[1][0]+lambda*C[1][0], GTG[1][1]+lambda*C[1][1], GTG[1][2]+lambda*C[1][2]],
+              [GTG[2][0]+lambda*C[2][0], GTG[2][1]+lambda*C[2][1], GTG[2][2]+lambda*C[2][2]]];
+    let x = solveSymmetric(A, GTe, 1e-5);
+
+    // 4) 信赖域：限制步长
+    const norm = Math.sqrt(x[0]*x[0]+x[1]*x[1]+x[2]*x[2]) || 1;
+    if(norm > radius){ x = x.map(v=> v * (radius / norm)); }
+
+    const eta=0.8; // 2.0 用更大胆步长，但仍投影
+    const suggestRaw={K: baseU.K + eta*x[0], L: baseU.L + eta*x[1], C: baseU.C + eta*x[2]};
+    const suggest = projectSimplex(suggestRaw);
+
+    // 5) 交互强度读数（0..1 归一化）
+    const offdiag=[C[0][1],C[1][2],C[2][0]]; const maxv=Math.max(...offdiag,1e-6);
+    const coupling={
+      "K×L": +(C[0][1]/maxv).toFixed(2),
+      "L×C": +(C[1][2]/maxv).toFixed(2),
+      "C×K": +(C[2][0]/maxv).toFixed(2),
+    };
+
+    setScan2({suggest, coupling, radius, note:"已考虑双变量耦合并约束步长"});
+    showMsg("微扫描 2.0 完成：已考虑交互项与信赖域","success");
+  }
+
+  const applyScan2Suggestion=()=>{ if(scan2?.suggest){ setKlc(scan2.suggest); showMsg("已应用微扫描 2.0 建议","success"); } };
+
+  // ---- 复制 API 参数 ----
+  const copyApiParams=async()=>{ const payload=JSON.stringify({profile, ...mapping},null,2); try{ await navigator.clipboard.writeText(payload); showMsg("已复制 API 参数到剪贴板","success"); }catch(err){ try{ const ta=document.createElement("textarea"); ta.value=payload; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); showMsg("已复制（兼容模式）","success"); }catch(e){ showMsg("复制失败："+String(e||err),"error"); } } };
+
+  // ---- 自测用例 ----
+  const [tests,setTests]=useState([]);
+  const runSelfTests=()=>{
+    const out=[]; const approx=(a,b,eps=1e-6)=>Math.abs(a-b)<eps;
+    const n1=normalizeKLC({K:0.4,L:0.4,C:0.2}); out.push({name:"normalize sum=1",pass:approx(n1.K+n1.L+n1.C,1)});
+    const mk0=mapKLCToApi({K:0,L:0.5,C:0.5},"creative"); out.push({name:"creative: K=0 → t≈tMin",pass:approx(mk0.temperature,PROFILES.creative.tMin)});
+    const mk1=mapKLCToApi({K:1,L:1,C:0},"creative"); out.push({name:"creative: K=1 → t≈tMax",pass:approx(mk1.temperature,PROFILES.creative.tMax)});
+    const macro=normalizeKLC({K:0.62,L:0.33,C:0.05}); out.push({name:"macro sum=1",pass:approx(macro.K+macro.L+macro.C,1)});
+    const prj=projectSimplex({K:1.2,L:-0.1,C:0.1}); out.push({name:"project to simplex",pass:approx(prj.K+prj.L+prj.C,1) && prj.K>=0 && prj.L>=0 && prj.C>=0});
+    const G=[[1,0,0],[0,1,0],[0,0,1]], e=[0.1,-0.2,0.3]; const GT=matT(G),GTG=matMul(GT,G),x=solveSymmetric(GTG,matVec(GT,e),1e-6); out.push({name:"LS solve sanity",pass:approx(x[0],0.1)&&approx(x[1],-0.2)&&approx(x[2],0.3)});
+    // MBG 测试
+    const a="测试A 文本", b="测试A 文本"; const A=tfVectorize(tokenizeWords(a)), B=tfVectorize(tokenizeWords(b)); const simSame=cosineSim(A,B); out.push({name:"MBG 同文≈0", pass:(1-simSame)<=0.05});
+    const c="完全不同的主题", d="quantum mechanics and tensors"; const C=tfVectorize(tokenizeWords(c)), Dv=tfVectorize(tokenizeWords(d)); const simDiff=cosineSim(C,Dv); out.push({name:"MBG 异文>0.5", pass:(1-simDiff)>0.5});
+    setTests(out); showMsg("已运行自测用例（8 项）","success");
+  };
+
+  // ---- 生成：离线 & API（API 可选） ----
+  const runOfflineSim=()=>{
+    const txt=simulateTextOffline(simPrompt, klc, PROFILES[profile].label);
+    setSimText(txt);
+    const m=computeMetrics(txt); pushHistory(klc,m,"offline");
+    showMsg("已用当前 K/L/C 生成离线模拟文本","success");
+  };
+
+  const generateText=async()=>{
+    setIsLoading(true); setError(null); setResponse("");
+    const cleaned = sanitizeText(simPrompt || "").trim();
+    if(!cleaned){ setError("请输入提示词。"); setIsLoading(false); return; }
+    if(!apiEnabled){ setError("API 开关未开启。你也可以直接使用上方的离线模拟输出。"); setIsLoading(false); return; }
+    if(!apiKey){ setError("未配置 API Key。此功能可选，离线模拟已可用。"); setIsLoading(false); return; }
+    const apiUrl=`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+    const payload={ contents:[{parts:[{text:cleaned}]}], generationConfig:{temperature:mapping.temperature, topP:mapping.top_p, maxOutputTokens:mapping.max_tokens} };
+    try{
+      const res=await fetch(apiUrl,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      if(!res.ok){ const errData=await res.json().catch(()=>({})); throw new Error(errData?.error?.message || `API error: ${res.status}`); }
+      const result=await res.json(); const text=result?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if(text){ setResponse(text); const m=computeMetrics(text); pushHistory(klc,m,"api"); } else { setError("无法生成响应（可能触发安全策略）。"); }
+    }catch(e){ setError(e.message || "请求失败。"); }
+    finally{ setIsLoading(false); }
+  };
+
+  // ================= 黑箱可视化：状态与计算 =================
+  const [vizRunning,setVizRunning]=useState(false);
+  const [ribbonStats,setRibbonStats]=useState(null); // {D:{p10,p50,p90,mean},S:{...},R:{...}}
+  const [importance,setImportance]=useState(null);   // [{token,score}]
+  const [heatMetric,setHeatMetric]=useState("R");    // "D"|"S"|"R"
+  const [heatData,setHeatData]=useState(null);       // {D:number[][], S:number[][], R:number[][], ks:number[], cs:number[]}
+
+  function tokenizeForImportance(text){
+    const t = sanitizeText(text||"");
+    const tokens = t.match(/[\u4e00-\u9fa5]|[A-Za-z0-9]+|\s+|[^\s\w]/g) || [];
+    // 限制长度，避免过重
+    if(tokens.length>200) return tokens.slice(0,200);
+    return tokens;
+  }
+
+  function runVisuals(){
+    const prompt = simPrompt || "示例：以当前主题生成一版结构化骨架";
+    setVizRunning(true);
+    try{
+      // 1) 多次生成缎带（N=7）
+      const N=7; const valsD=[], valsS=[], valsR=[];
+      for(let i=0;i<N;i++){
+        const txt=simulateTextOffline(prompt, klc, PROFILES[profile].label, i);
+        const m=computeMetrics(txt);
+        valsD.push(m.D); valsS.push(m.S); valsR.push(m.R);
+      }
+      const stats=(arr)=>({ p10:+quantile(arr,0.10).toFixed(2), p50:+quantile(arr,0.50).toFixed(2), p90:+quantile(arr,0.90).toFixed(2), mean:+(arr.reduce((a,b)=>a+b,0)/arr.length).toFixed(2) });
+      setRibbonStats({ D:stats(valsD), S:stats(valsS), R:stats(valsR) });
+
+      // 2) 词重要度（遮蔽法，基于当前文本或最新模拟）
+      let baseText = currentText;
+      if(!baseText){ baseText = simulateTextOffline(prompt, klc, PROFILES[profile].label, 123); setSimText(baseText); }
+      const baseM = computeMetrics(baseText);
+      const tokens = tokenizeForImportance(baseText);
+      const imp=[]; const wD=0.2,wS=0.3,wR=0.5;
+      for(let i=0;i<tokens.length;i++){
+        const alt = tokens.slice(0,i).join("") + tokens.slice(i+1).join("");
+        const m = computeMetrics(alt);
+        const score = Math.abs(m.D-baseM.D)*wD + Math.abs(m.S-baseM.S)*wS + Math.abs(m.R-baseM.R)*wR;
+        imp.push({ token: tokens[i], score:+score.toFixed(3) });
+      }
+      setImportance(imp);
+
+      // 3) (K×C) 热力图（固定 L，归一化后保持比例）
+      const GRID=7; const ks=[], cs=[];
+      for(let i=0;i<GRID;i++){ ks.push(i/(GRID-1)); }
+      for(let j=0;j<GRID;j++){ cs.push(j/(GRID-1)); }
+      const gridD=[], gridS=[], gridR=[];
+      const Lfix = Math.max(0, Math.min(1, klc.L));
+      const rem = Math.max(1e-6, 1 - Lfix);
+      for(let i=0;i<GRID;i++){
+        const rowD=[], rowS=[], rowR=[];
+        for(let j=0;j<GRID;j++){
+          // 双轴作为 K 与 C 的相对占比，再在 (1-L) 内按比例分配，确保 L 固定
+          const kr = ks[i], cr = cs[j];
+          const denom = Math.max(1e-9, kr + cr);
+          const K = rem * (kr / denom);
+          const C = rem * (cr / denom);
+          const cand = { K, L: Lfix, C };
+          const txt=simulateTextOffline(prompt, cand, PROFILES[profile].label, i*37+j*11);
+          const m=computeMetrics(txt);
+          rowD.push(m.D); rowS.push(m.S); rowR.push(m.R);
+        }
+        gridD.push(rowD); gridS.push(rowS); gridR.push(rowR);
+      }
+      setHeatData({D:gridD, S:gridS, R:gridR, ks, cs});
+
+      pushHistory(klc, metrics, "offline", "运行可视化");
+      showMsg("黑箱可视化计算完成","success");
+    }catch(e){
+      console.error(e);
+      showMsg("可视化计算失败："+String(e&&e.message?e.message:e),"error");
+    }finally{
+      setVizRunning(false);
+    }
+  }
+
+  // ---- UI ----
+  // ---- 正交轴（SVD on Jacobian）+ 自然梯度 / Doubt Suite / Gate ----
+  const [svd, setSvd] = useState(null); // {V:number[3][3], sigma:number[3]}
+  const [natGrad, setNatGrad] = useState({enabled:false, alphaR:0.4, betaS:0.3, gammaD:0.1, lr:0.6});
+  const [doubt, setDoubt] = useState(null);
+  // 高级阈值 & 轴步长（与本地持久化配合）
+  const [gateThr, setGateThr] = useState({ R: 0.60, CD: 0.65, MBG: 0.25 });
+  const [axisSteps, setAxisSteps] = useState({ a1: 0.08, a2: 0.06, a3: 0.04 }); // {lower:{D,S,R,CD}, cases:[...]}
+
+  // —— 意图对齐（MBG = 1 - cos） ——
+  const [intentText, setIntentText] = useState("");
+  const [mbg, setMbg] = useState(null); // 0..1
+  function tokenizeWords(s){ const t=sanitizeText(s||"").toLowerCase(); return t.match(/[一-龥]|[a-z0-9]+/gi) || []; }
+  function tfVectorize(tokens){ const m=new Map(); tokens.forEach(w=>m.set(w,(m.get(w)||0)+1)); return m; }
+  function cosineSim(mapA,mapB){ let dot=0,na=0,nb=0; const keys=new Set([...mapA.keys(),...mapB.keys()]); keys.forEach(k=>{ const a=mapA.get(k)||0,b=mapB.get(k)||0; dot+=a*b; na+=a*a; nb+=b*b; }); if(na===0||nb===0) return 0; return dot/Math.sqrt(na*nb); }
+  function computeMBG(){
+    const intent=intentText.trim(); const text=(simText||response||"").trim();
+    if(!intent||!text){ setMbg(null); showMsg("请输入意图文本，并生成/粘贴当前文本后再试","error"); return; }
+    const A=tfVectorize(tokenizeWords(intent)); const B=tfVectorize(tokenizeWords(text));
+    const sim=cosineSim(A,B); const mbgVal=+(1-sim).toFixed(2); setMbg(mbgVal);
+    showMsg(`已计算 MBG（意图-成文差距）=${mbgVal}`,"success");
+  }
+
+  function vecDot(a,b){let s=0; for(let i=0;i<a.length;i++) s+=a[i]*b[i]; return s;}
+  function vecNorm(a){return Math.sqrt(Math.max(1e-12, vecDot(a,a)));}
+  function vecScale(a,k){return a.map(x=>x*k);} 
+  function vecAdd(a,b){return a.map((x,i)=>x+b[i]);}
+  // 复用前面已定义的 matVec(A,v)
+
+  function topEigen(M, iters=40){
+    let v=[1,0,0];
+    for(let i=0;i<iters;i++){ v = matVec(M,v); const n=vecNorm(v); v = n>0? v.map(x=>x/n):[1,0,0]; }
+    const lambda = vecDot(v, matVec(M,v));
+    return {val:lambda, vec:v};
+  }
+  function deflate(M, eig){
+    const {val, vec:v}=eig; const d=[[v[0]*v[0], v[0]*v[1], v[0]*v[2]],[v[1]*v[0], v[1]*v[1], v[1]*v[2]],[v[2]*v[0], v[2]*v[1], v[2]*v[2]]];
+    const out=[[],[],[]];
+    for(let i=0;i<3;i++) for(let j=0;j<3;j++) out[i][j]=M[i][j]-val*d[i][j];
+    return out;
+  }
+  function eigenSym3(M){
+    const e1=topEigen(M); const M2=deflate(M,e1);
+    const e2=topEigen(M2); const M3=deflate(M2,e2);
+    const e3=topEigen(M3);
+    const arr=[e1,e2,e3].map(e=>({val:Math.max(0,e.val), vec:vecScale(e.vec, 1/vecNorm(e.vec))}))
+                      .sort((a,b)=>b.val-a.val);
+    return {vals:arr.map(x=>x.val), vecs:arr.map(x=>x.vec)};
+  }
+  function computeOrthogonalAxes(delta=0.05){
+    const baseU={...klc};
+    const prompt = simPrompt || "示例：以当前主题生成一版结构化骨架";
+    const G = estimateJacobian(baseU, prompt, delta);
+    const GT = matT(G); const GTG = matMul(GT,G);
+    const eig = eigenSym3(GTG);
+    const sigma = eig.vals.map(v=>Math.sqrt(Math.max(0,v)));
+    const V = eig.vecs; setSvd({V, sigma});
+    showMsg("已计算正交拨杆轴（Axis-1/2/3）","success");
+  }
+  function stepAlongAxis(axis=0, step=0.08){
+    if(!svd){ computeOrthogonalAxes(); return; }
+    const dir=[svd.V[axis][0], svd.V[axis][1], svd.V[axis][2]];
+    const suggestRaw = {K: klc.K + step*dir[0], L: klc.L + step*dir[1], C: klc.C + step*dir[2]};
+    const suggest = projectSimplex(suggestRaw);
+    setKlc(suggest);
+    showMsg(`已沿 Axis-${axis+1} 前进`, "success");
+  }
+  function softmax3(x){ const m=Math.max(...x); const ex=x.map(v=>Math.exp(v-m)); const s=ex[0]+ex[1]+ex[2]; return ex.map(v=>v/s); }
+  function applyNaturalGradStep(delta=0.05){
+    const baseU={...klc};
+    const prompt = simPrompt || "示例：以当前主题生成一版结构化骨架";
+    const G = estimateJacobian(baseU, prompt, delta);
+    const wOut=[natGrad.gammaD, natGrad.betaS, natGrad.alphaR];
+    const grad = matVec(matT(G), wOut);
+    const theta=[Math.log(klc.K+1e-9), Math.log(klc.L+1e-9), Math.log(klc.C+1e-9)];
+    const next = softmax3([theta[0]+natGrad.lr*grad[0], theta[1]+natGrad.lr*grad[1], theta[2]+natGrad.lr*grad[2]]);
+    setKlc({K:next[0], L:next[1], C:next[2]});
+    showMsg("已应用自然梯度步进（softmax 约束）","success");
+  }
+  function runDoubtSuite(){
+    const baseU={...klc};
+    const prompt = simPrompt || "示例：以当前主题生成一版结构化骨架";
+    const seeds=[101,202,303]; const cases=[]; let lower={D:1,S:1,R:1,CD:1};
+    for(const s of seeds){
+      const txt = simulateTextOffline(prompt, baseU, PROFILES[profile].label, s);
+      const m = computeMetrics(txt);
+      const CD = Math.max(0, Math.min(1, 0.6*m.R + 0.4*m.S));
+      lower={D:Math.min(lower.D,m.D), S:Math.min(lower.S,m.S), R:Math.min(lower.R,m.R), CD:Math.min(lower.CD,CD)};
+      cases.push({seed:s, ...m, CD});
+    }
+    setDoubt({lower, cases});
+    showMsg("已完成 Doubt Suite（取最坏一档）","success");
+  }
+  function evalRobustGate(){
+    if(!doubt){ showMsg("请先运行 Doubt Suite","error"); return; }
+    const okCore = (doubt.lower.R>=gateThr.R) && (doubt.lower.CD>=gateThr.CD);
+    const okMBG = (mbg==null) ? true : (mbg<=gateThr.MBG);
+    const ok = okCore && okMBG;
+    const reason = ok ? `Gate 通过（鲁棒${mbg==null?"":"·对齐"}）` : (!okCore ? "Gate 未过：R/CD 下界不足" : "Gate 未过：MBG 超阈值，意图与成文不对齐");
+    showMsg(reason, ok?"success":"error");
+  }
+
+  // —— 持久化（高级设置，独立键） ——
+  useEffect(()=>{ if(typeof window==="undefined") return; try{ const raw=localStorage.getItem(STORE_KEY+":adv"); if(!raw) return; const s=JSON.parse(raw); if(s.natGrad) setNatGrad(v=>({...v,...s.natGrad})); if(s.gateThr) setGateThr(t=>({...t,...s.gateThr})); if(s.axisSteps) setAxisSteps(a=>({...a,...s.axisSteps})); showMsg("已恢复高级设置","success"); }catch{} },[]);
+  useEffect(()=>{ if(typeof window==="undefined") return; try{ localStorage.setItem(STORE_KEY+":adv", JSON.stringify({natGrad, gateThr, axisSteps})); }catch{} }, [natGrad, gateThr, axisSteps]);
+
+  return (
+    <div className="p-6 space-y-6">
+      {msg && (
+        <div className={`rounded-md p-3 text-sm ${ msg.type==="success"?"bg-green-50 text-green-700 border border-green-200": msg.type==="error"?"bg-red-50 text-red-700 border border-red-200": "bg-gray-50 text-gray-700 border border-gray-200" }`}>
+          {msg.text}
+        </div>
+      )}
+
+      {/* 模式 & Profile */}
+      <Card>
+        <CardContent className="p-4 space-y-4">
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <h2 className="text-2xl font-bold">驾驶舱：K/L/C + 指标控制</h2>
+            <div className="flex flex-wrap gap-2">
+              <Button variant={mode==="simple"?"default":"outline"} onClick={()=>setMode("simple")}>简单模式</Button>
+              <Button variant={mode==="advanced"?"default":"outline"} onClick={()=>setMode("advanced")}>进阶模式</Button>
+              <span className="w-px h-6 bg-gray-200 mx-1 hidden md:inline-block" />
+              {Object.entries(PROFILES).map(([k,p])=> (
+                <Button key={k} variant={profile===k?"default":"outline"} onClick={()=>setProfile(k)}>{p.label}</Button>
+              ))}
+            </div>
+          </div>
+          <p className="text-sm text-gray-600">Creative（更发散）/ Factual（更保守）/ Code（最保守）。每 3 轮建议 Gate 收口，R 低两轮触发 Barrier 自动升 C。</p>
+        </CardContent>
+      </Card>
+
+      {/* 场景清单（简） */}
+      <Card>
+        <CardContent className="p-4 space-y-2">
+          <h2 className="text-lg font-semibold">典型场景</h2>
+          <p className="text-sm text-gray-700">方案蓝图、演讲大纲、路演骨架、研究综述、课程议程、品牌 Campaign、OKR 规划等。</p>
+        </CardContent>
+      </Card>
+
+      {/* 简单模式 */}
+      {mode==="simple" && (
+        <Card>
+          <CardContent className="p-4 space-y-6">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-xl font-bold">五层螺旋 · 雷达图（简单模式）</h2>
+              <Button variant="outline" onClick={()=>{ resetSimple(); showMsg("已重置默认值","success"); }}>重置默认值</Button>
+            </div>
+            {isClient && (
+              <ResponsiveContainer width="100%" height={360}>
+                <RadarChart cx="50%" cy="50%" outerRadius="80%" data={radarData}>
+                  <PolarGrid />
+                  <PolarAngleAxis dataKey="layer" />
+                  <Radar name="价值强度" dataKey="value" stroke="#6366f1" fill="#6366f1" fillOpacity={0.6} />
+                </RadarChart>
+              </ResponsiveContainer>
+            )}
+            <div className="space-y-4">
+              {Object.keys(values).map(k=> (
+                <div key={k}>
+                  <label className="block text-sm font-medium text-gray-700">{k}: {values[k]}</label>
+                  <Slider value={[values[k]]} onValueChange={(val)=>setValues({...values,[k]:val[0]})} min={0} max={10} step={1} />
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* 进阶模式 */}
+      {mode==="advanced" && (
+        <Card>
+          <CardContent className="p-4 space-y-6">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-xl font-bold">K / L / C 精细控制（进阶模式）</h2>
+              <div className="flex gap-2 flex-wrap">
+                <Button variant="outline" onClick={()=>{ resetAdvanced(); showMsg("已重置 K/L/C","success"); }}>重置 K/L/C</Button>
+                <Button onClick={copyApiParams}>复制 API 参数</Button>
+                <Button variant="secondary" onClick={applyMacroHiKHiLLoC}>一键：创生↑ 结构↑ 约束↓</Button>
+                <Button variant="outline" onClick={microScan}>±0.05 微扫描</Button>
+                <Button variant="outline" onClick={applyGate}>进入 Gate（C≈0.6）</Button>
+                <Button variant="outline" onClick={runSelfTests}>运行自测</Button>
+              </div>
+            </div>
+
+            <div className="grid md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700">K · 创生（{klc.K.toFixed(2)}）</label>
+                <Slider value={[klc.K]} onValueChange={(v)=>setPart("K", +v[0])} min={0} max={1} step={0.01} />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700">L · 结构（{klc.L.toFixed(2)}）</label>
+                <Slider value={[klc.L]} onValueChange={(v)=>setPart("L", +v[0])} min={0} max={1} step={0.01} />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700">C · 约束（{klc.C.toFixed(2)}）</label>
+                <Slider value={[klc.C]} onValueChange={(v)=>setPart("C", +v[0])} min={0} max={1} step={0.01} />
+              </div>
+            </div>
+            <p className="text-xs text-gray-500">K+L+C=1；Profile 改变映射范围。建议：冲刺 R≈0.35，收口 R≥0.60。</p>
+
+            {/* API 参数预览 */}
+            <div className="p-4 rounded-md border">
+              <h3 className="text-sm font-semibold mb-2">API 参数建议（{PROFILES[profile].label}）</h3>
+              <ul className="text-sm space-y-1">
+                <li>temperature：<b>{mapping.temperature}</b></li>
+                <li>top_p：<b>{mapping.top_p}</b></li>
+                <li>max_tokens：<b>{mapping.max_tokens}</b></li>
+              </ul>
+            </div>
+
+            {/* 指标面板 */}
+            <div className="p-4 rounded-md border">
+              <h3 className="text-sm font-semibold mb-2">D/S/R 指标（基于当前文本）</h3>
+              <div className="grid md:grid-cols-3 gap-3 text-sm">
+                {([{k:"D",label:"多样性",tar:0.75},{k:"S",label:"结构度",tar:0.70},{k:"R",label:"可证度",tar:0.35}]).map(item=> (
+                  <div key={item.k}>
+                    <div className="flex justify-between"><span>{item.label}</span><span>{metrics[item.k]} / 目标 {item.tar}</span></div>
+                    <div className="h-2 bg-gray-200 rounded"><div className="h-2 rounded" style={{width:`${Math.min(100,metrics[item.k]*100)}%`, backgroundColor: metrics[item.k]>=item.tar?"#16a34a":"#f59e0b"}}/></div>
+                  </div>
+                ))}
+              </div>
+              {/* v1 建议 */}
+              {scan && (
+                <div className="mt-3 text-sm">
+                  <div className="font-medium">建议拨杆（v1）：{scan.note}</div>
+                  <div className="text-gray-600">K→{scan.suggest.K.toFixed(2)}，L→{scan.suggest.L.toFixed(2)}，C→{scan.suggest.C.toFixed(2)}</div>
+                  <div className="mt-2 flex gap-2 flex-wrap"><Button size="sm" onClick={applyScanSuggestion}>应用 v1 建议</Button><Button size="sm" variant="outline" onClick={()=>setScan(null)}>清除 v1</Button></div>
+                </div>
+              )}
+              {/* v2 建议 */}
+              {scan2 && (
+                <div className="mt-4 text-sm">
+                  <div className="font-medium">建议拨杆（v2，交互+信赖域）</div>
+                  <div className="text-gray-600">K→{scan2.suggest.K.toFixed(2)}，L→{scan2.suggest.L.toFixed(2)}，C→{scan2.suggest.C.toFixed(2)}（半径 {scan2.radius}）</div>
+                  <div className="mt-1 text-xs text-gray-600">交互强度（0..1，越高耦合越强）：
+                    <span className="ml-2">K×L {scan2.coupling["K×L"]}</span>
+                    <span className="ml-2">L×C {scan2.coupling["L×C"]}</span>
+                    <span className="ml-2">C×K {scan2.coupling["C×K"]}</span>
+                  </div>
+                  <div className="mt-2 flex gap-2 flex-wrap"><Button size="sm" onClick={applyScan2Suggestion}>应用 v2 建议</Button><Button size="sm" variant="outline" onClick={()=>setScan2(null)}>清除 v2</Button></div>
+                </div>
+              )}
+              <div className="mt-3 flex gap-2 flex-wrap">
+                <Button variant="outline" onClick={microScan}>±0.05 微扫描（v1）</Button>
+                <Button variant="outline" onClick={()=>microScan2(0.05, 0.12)}>微扫描 2.0（交互+信赖域）</Button>
+              </div>
+            </div>
+
+            {/* 🧭 高级控制（正交 / 自然梯度 / Doubt Suite / MBG） */}
+            <Card>
+              <CardContent className="p-4 space-y-4">
+                <h3 className="text-xl font-bold">🧭 高级控制</h3>
+                <div className="grid md:grid-cols-2 gap-4">
+                  {/* 正交拨杆 */}
+                  <div className="p-3 rounded-md border">
+                    <div className="flex items-center justify-between">
+                      <div className="font-semibold">正交拨杆（SVD on Jacobian）</div>
+                      <Button size="sm" variant="outline" onClick={()=>computeOrthogonalAxes()}>计算轴</Button>
+                    </div>
+                    {svd ? (
+                      <div className="mt-2 text-sm space-y-2">
+                        <div>σ ≈ [{svd.sigma.map(s=>s.toFixed(2)).join(", ")}]</div>
+                        <div className="flex gap-2 flex-wrap">
+                          <Button size="sm" onClick={()=>stepAlongAxis(0,0.08)}>沿 Axis-1</Button>
+                          <Button size="sm" variant="outline" onClick={()=>stepAlongAxis(1,0.06)}>沿 Axis-2</Button>
+                          <Button size="sm" variant="outline" onClick={()=>stepAlongAxis(2,0.04)}>沿 Axis-3</Button>
+                        </div>
+                      </div>
+                    ) : <div className="mt-2 text-xs text-gray-600">点击“计算轴”以获取 Axis-1/2/3 与奇异值。</div>}
+                  </div>
+
+                  {/* 自然梯度 */}
+                  <div className="p-3 rounded-md border">
+                    <div className="font-semibold">自然梯度（softmax 约束）</div>
+                    <div className="mt-2 grid grid-cols-2 gap-2 text-sm">
+                      <label className="flex items-center gap-2">R权重
+                        <input type="number" step="0.05" min="0" max="1" className="w-20 border rounded p-1" value={natGrad.alphaR}
+                          onChange={e=>setNatGrad({...natGrad, alphaR:+e.target.value})}/>
+                      </label>
+                      <label className="flex items-center gap-2">S权重
+                        <input type="number" step="0.05" min="0" max="1" className="w-20 border rounded p-1" value={natGrad.betaS}
+                          onChange={e=>setNatGrad({...natGrad, betaS:+e.target.value})}/>
+                      </label>
+                      <label className="flex items-center gap-2">D权重
+                        <input type="number" step="0.05" min="0" max="1" className="w-20 border rounded p-1" value={natGrad.gammaD}
+                          onChange={e=>setNatGrad({...natGrad, gammaD:+e.target.value})}/>
+                      </label>
+                      <label className="flex items-center gap-2">步长
+                        <input type="number" step="0.05" min="0.05" max="1" className="w-20 border rounded p-1" value={natGrad.lr}
+                          onChange={e=>setNatGrad({...natGrad, lr:+e.target.value})}/>
+                      </label>
+                    </div>
+                    <div className="mt-2"><Button size="sm" onClick={()=>applyNaturalGradStep()}>应用自然梯度步进</Button></div>
+                  </div>
+                </div>
+
+                {/* Doubt Suite & Gate */}
+                <div className="p-3 rounded-md border">
+                  <div className="flex items-center justify-between">
+                    <div className="font-semibold">Descartes Doubt Suite & Robust Gate</div>
+                    <div className="flex gap-2">
+                      <Button size="sm" variant="outline" onClick={runDoubtSuite}>运行 Doubt Suite</Button>
+                      <Button size="sm" onClick={evalRobustGate}>Gate 判定</Button>
+                    </div>
+                  </div>
+                  {doubt ? (
+                    <div className="mt-2 text-sm">
+                      <div>最坏一档下界：R <b>{doubt.lower.R.toFixed(2)}</b>，CD <b>{doubt.lower.CD.toFixed(2)}</b>，D <b>{doubt.lower.D.toFixed(2)}</b>，S <b>{doubt.lower.S.toFixed(2)}</b></div>
+                      <div className="text-xs text-gray-600 mt-1">Gate 条件：R≥0.60 且 CD≥0.65；若启用 MBG，则还需 MBG≤0.25。</div>
+                    </div>
+                  ) : <div className="mt-2 text-xs text-gray-600">点击运行以计算三种对抗情境下的指标下界。</div>}
+                </div>
+
+                {/* 意图对齐（MBG） */}
+                <div className="p-3 rounded-md border">
+                  <div className="font-semibold">🧠 意图-成文对齐（MBG）</div>
+                  <p className="text-xs text-gray-600 mt-1">输入你的“一句话意图/结论”，对比当前文本，计算 MBG=1-cos。建议 Gate 前 MBG≤0.25。</p>
+                  <textarea className="w-full min-h-[60px] p-2 border rounded-md mt-2 text-sm" placeholder="例如：面向中小企业，给出一页可执行增长策略，重点在低成本实验与衡量" value={intentText} onChange={(e)=>setIntentText(e.target.value)} />
+                  <div className="mt-2 flex items-center gap-3">
+                    <Button size="sm" variant="outline" onClick={computeMBG}>计算 MBG</Button>
+                    <span className="text-sm">{mbg==null? "未计算" : `MBG=${mbg}`}</span>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* 🧪 离线模拟（无需 API） */}
+            <Card>
+              <CardContent className="p-4 space-y-4">
+                <h3 className="text-xl font-bold">🧪 离线模拟输出（无需 API）</h3>
+                <p className="text-sm text-gray-600">填主题→生成文本→观察上方 D/S/R 曲线随 K/L/C 的变化。</p>
+                <textarea className="w-full min-h-[90px] p-2 border rounded-md resize-y focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="输入一个主题或提示词…" value={simPrompt} onChange={(e)=>setSimPrompt(e.target.value)} />
+                <div className="flex gap-2 flex-wrap">
+                  <Button onClick={runOfflineSim}>生成模拟文本</Button>
+                  <Button variant="outline" onClick={()=>{ setSimText(""); }}>清空结果</Button>
+                </div>
+                {simText && (<div className="mt-3 p-4 bg-gray-50 border rounded-md text-sm whitespace-pre-wrap max-h-60 overflow-y-auto">{simText}</div>)}
+              </CardContent>
+            </Card>
+
+            {/* ✨ API 生成（可选，带开关） */}
+            <Card>
+              <CardContent className="p-4 space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xl font-bold">✨ API 生成（可选）</h3>
+                  <label className="flex items-center gap-2 text-sm select-none">
+                    <input type="checkbox" checked={apiEnabled} onChange={(e)=>setApiEnabled(e.target.checked)} />
+                    <span>{apiEnabled?"已开启":"已关闭"}</span>
+                  </label>
+                </div>
+                <p className="text-xs text-gray-500">关闭时不调用外部接口，保留本地离线模拟即可。</p>
+                <input type="password" className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="在此输入 Gemini API Key（可留空）" value={apiKey} onChange={(e)=>setApiKey(e.target.value)} disabled={!apiEnabled} />
+                <div className="flex gap-2 flex-wrap">
+                  <Button onClick={generateText} disabled={!apiEnabled || !apiKey || isLoading}>{isLoading?"生成中...":"调用 API 生成"}</Button>
+                </div>
+                {!apiEnabled && <div className="text-xs text-gray-600">提示：当前 API 调用已关闭。如需外部模型，请上方打开开关。</div>}
+                {error && <div className="p-2 text-sm text-red-700 bg-red-50 rounded-md border border-red-200">{error}</div>}
+                {response && (<div className="mt-3 p-4 bg-gray-50 border rounded-md text-sm whitespace-pre-wrap max-h-60 overflow-y-auto">{response}</div>)}
+              </CardContent>
+            </Card>
+
+            {/* 📊 黑箱可视化面板 */}
+            <Card>
+              <CardContent className="p-4 space-y-5">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-xl font-bold">📊 黑箱可视化</h3>
+                  <div className="flex gap-2 items-center text-sm">
+                    <span>热力图指标：</span>
+                    {["D","S","R"].map(k=> (
+                      <Button key={k} size="sm" variant={heatMetric===k?"default":"outline"} onClick={()=>setHeatMetric(k)}>{k}</Button>
+                    ))}
+                    <Button size="sm" onClick={runVisuals} disabled={vizRunning}>{vizRunning?"计算中…":"运行可视化"}</Button>
+                  </div>
+                </div>
+
+                {/* 1) 多次生成缎带 */}
+                <div className="p-3 rounded-md border">
+                  <div className="text-sm font-semibold mb-2">① 多次生成稳定度（p10 — p50 — p90）</div>
+                  {ribbonStats ? (
+                    <div className="grid md:grid-cols-3 gap-3 text-sm">
+                      {Object.entries(ribbonStats).map(([k,v])=> (
+                        <div key={k}>
+                          <div className="flex justify-between"><span>{k}</span><span>均值 {v.mean}</span></div>
+                          <div className="h-3 bg-gray-200 rounded relative">
+                            <div className="absolute h-3 rounded" style={{left:`${v.p10*100}%`, width:`${Math.max(1,(v.p90-v.p10)*100)}%`, background: "linear-gradient(90deg, #f59e0b, #10b981)"}} />
+                            <div className="absolute -top-4 text-xs" style={{left:`calc(${v.p50*100}% - 6px)`}}>▲</div>
+                          </div>
+                          <div className="flex justify-between text-[11px] text-gray-600 mt-1"><span>p10 {v.p10}</span><span>p50 {v.p50}</span><span>p90 {v.p90}</span></div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <div className="text-xs text-gray-500">点击上方“运行可视化”计算。</div>}
+                </div>
+
+                {/* 2) 词/句重要度热图（遮蔽法） */}
+                <div className="p-3 rounded-md border">
+                  <div className="text-sm font-semibold mb-2">② 词级重要度（遮蔽法）</div>
+                  {importance ? (
+                    <div className="text-sm leading-7 flex flex-wrap">
+                      {importance.map((t,i)=> (
+                        <span key={i} style={{ backgroundColor: colorScale01(Math.min(1, t.score*2)), borderRadius: 3, padding: t.token.trim()?"0 2px":"0" }}>
+                          {t.token}
+                        </span>
+                      ))}
+                    </div>
+                  ) : <div className="text-xs text-gray-500">基于当前文本自动计算：颜色越绿，越影响 D/S/R；越红影响越小。</div>}
+                </div>
+
+                {/* 3) (K×C) 热力图（固定 L） */}
+                <div className="p-3 rounded-md border">
+                  <div className="text-sm font-semibold mb-2">③ (K×C) 热力图（固定 L={klc.L.toFixed(2)}）</div>
+                  {heatData ? (
+                    <div className="space-y-2">
+                      <div className="grid" style={{gridTemplateColumns: `repeat(${heatData[heatMetric][0].length}, minmax(0,1fr))`, gap: 2}}>
+                        {heatData[heatMetric].flatMap((row, i)=> row.map((v,j)=> (
+                          <div key={`${i}-${j}`} title={`K=${heatData.ks[i].toFixed(2)} C=${heatData.cs[j].toFixed(2)} ${heatMetric}=${v.toFixed(2)}`} style={{backgroundColor: colorScale01(v), height: 16, borderRadius: 2}} />
+                        )))}
+                      </div>
+                      <div className="text-[11px] text-gray-600">深绿=该指标高。提示：点击“微扫描”后，优先在热力图的“甜区”附近微调旋钮。</div>
+                    </div>
+                  ) : <div className="text-xs text-gray-500">点击上方“运行可视化”生成 7×7 网格（K 与 C 变化，L 固定）。</div>}
+                </div>
+
+                {/* 4) 事件时间线 */}
+                <div className="p-3 rounded-md border">
+                  <div className="text-sm font-semibold mb-2">④ 事件时间线</div>
+                  {history.length? (
+                    <ul className="text-xs space-y-1 max-h-40 overflow-auto">
+                      {[...history].slice(-12).reverse().map((h,i)=> (
+                        <li key={i} className="flex items-center gap-2">
+                          <span className="inline-block w-2 h-2 rounded-full" style={{backgroundColor: h.source==="api"?"#3b82f6":"#6b7280"}}/>
+                          <span>{new Date(h.t).toLocaleTimeString()}</span>
+                          <span>u=({h.u.K.toFixed(2)}, {h.u.L.toFixed(2)}, {h.u.C.toFixed(2)})</span>
+                          <span>m=({h.m.D.toFixed(2)}, {h.m.S.toFixed(2)}, {h.m.R.toFixed(2)})</span>
+                          {h.note && <span className="text-gray-600">— {h.note}</span>}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : <div className="text-xs text-gray-500">暂无历史。运行模拟/可视化后会记录参数与指标变化。</div>}
+                </div>
+              </CardContent>
+            </Card>
+
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
